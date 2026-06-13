@@ -11,7 +11,7 @@ from email.mime.multipart import MIMEMultipart
 # ── VOS IDENTIFIANTS ─────────────────────────────────────────
 AUTO1_EMAIL    = "d.m30@hotmail.fr"
 AUTO1_PASSWORD = "Khamma30@"
-INTERVALLE_SEC = 300  # 5 minutes
+INTERVALLE_SEC = 60  # 5 minutes
 
 EMAIL_EXPEDITEUR   = "d.m30@hotmail.fr"
 EMAIL_MOT_PASSE    = "Khamma30@"
