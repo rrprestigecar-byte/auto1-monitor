@@ -1,34 +1,76 @@
-import os, re, time, logging, requests, json, smtplib, threading
+"""
+Auto1 Monitor — version corrigée et instrumentée
+═══════════════════════════════════════════════════════════════
+⚠️ AVERTISSEMENT IMPORTANT (à lire avant de redéployer) :
+
+Auto1.com est une plateforme B2B (enchères pour professionnels de
+l'automobile). Deux risques majeurs qui peuvent expliquer "0 notification"
+et que je ne peux PAS diagnostiquer sans accès réseau dans mon environnement :
+
+1. Le site peut nécessiter un compte pro vérifié (KYC) pour voir
+   le moindre prix/annonce — même avec un login qui "réussit" techniquement.
+2. La page de résultats peut être une SPA qui charge les annonces via un
+   appel JS (fetch/XHR) APRÈS le rendu initial. Dans ce cas le bloc
+   __NEXT_DATA__ scrappé ici ne contiendra jamais les vraies données.
+
+→ Ce script envoie maintenant un RAPPORT DE DIAGNOSTIC complet sur
+  Telegram au démarrage (et via la commande /diagnostic). Lance-le,
+  regarde ce rapport, et renvoie-le-moi : on saura exactement quoi
+  corriger ensuite au lieu de deviner.
+
+→ Si tu veux la solution la plus fiable à terme : ouvre auto1.com dans
+  un navigateur, F12 → onglet Network → filtre XHR/Fetch, lance une
+  recherche correspondant à un de tes profils, et regarde quelle requête
+  JSON contient réellement les annonces. Partage-moi son URL + ses
+  paramètres : j'appellerai directement cette API, ce qui est bien plus
+  fiable que parser du HTML.
+═══════════════════════════════════════════════════════════════
+"""
+
+import os, re, time, logging, requests, json, smtplib, threading, hashlib, sys
 from datetime import datetime, date
 from bs4 import BeautifulSoup
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # ── CONFIGURATION ─────────────────────────────────────────────
-AUTO1_EMAIL      = os.environ.get("AUTO1_EMAIL", "")
-AUTO1_PASSWORD   = os.environ.get("AUTO1_PASSWORD", "")
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+AUTO1_EMAIL        = os.environ.get("AUTO1_EMAIL", "")
+AUTO1_PASSWORD     = os.environ.get("AUTO1_PASSWORD", "")
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 EMAIL_EXPEDITEUR   = os.environ.get("EMAIL_EXPEDITEUR", "")
 EMAIL_MOT_PASSE    = os.environ.get("EMAIL_MOT_PASSE", "")
 EMAIL_DESTINATAIRE = os.environ.get("EMAIL_DESTINATAIRE", "")
-GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-NTFY_TOPIC       = os.environ.get("NTFY_TOPIC", "auto1-alertes")
-SCORE_MIN        = int(os.environ.get("SCORE_MIN", "6"))
-HEURE_RESUME     = 20  # Heure du résumé quotidien
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+NTFY_TOPIC         = os.environ.get("NTFY_TOPIC", "auto1-alertes")
+SCORE_MIN          = int(os.environ.get("SCORE_MIN", "6"))
+HEURE_RESUME       = int(os.environ.get("HEURE_RESUME", "20"))
+INTERVALLE_SEC     = int(os.environ.get("INTERVALLE_SEC", "30"))
+# Base d'URL à VÉRIFIER manuellement sur le site (voir avertissement plus haut)
+AUTO1_BUY_URL_BASE = os.environ.get("AUTO1_BUY_URL_BASE", "https://www.auto1.com/fr/home/buy")
 
-SMTP_SERVEUR   = "smtp.office365.com"
-SMTP_PORT      = 587
-INTERVALLE_SEC = 30
+SMTP_SERVEUR = "smtp.office365.com"
+SMTP_PORT    = 587
 
-# ── ÉTAT GLOBAL ───────────────────────────────────────────────
+# Sur les hébergeurs avec disque éphémère (Railway/Render free tier...), /tmp
+# peut être effacé à chaque redéploiement. Si tu as un disque persistant,
+# pointe SAVE_FILE vers ce disque via une variable d'environnement.
+SAVE_FILE = os.environ.get("SAVE_FILE", "/tmp/auto1_state.json")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ── ÉTAT GLOBAL (protégé par lock car partagé entre threads) ──
+etat_lock = threading.Lock()
 surveillance_active = True
 deja_vus = set()
 meilleures_annonces = []
 stats_jour = {"total": 0, "alertes": 0, "date": str(date.today())}
 cycle_count = 0
-derniere_connexion = None
+derniere_connexion_ok = False
+derniere_connexion_ts = None
 resume_envoye_aujourdhui = False
+dernier_diagnostic = {}
 
 # ── RECHERCHES ────────────────────────────────────────────────
 RECHERCHES = [
@@ -50,9 +92,6 @@ RECHERCHES = [
     {"nom": "🚐 Utilitaire | 500-2500€ | max 230k km","make": None,      "model": None,     "prix_min": 500,  "prix_max": 2500, "km_min": 0, "km_max": 230000, "fuel": ["diesel","petrol"], "type": "van"},
 ]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9",
@@ -62,57 +101,100 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# ── SAUVEGARDE ────────────────────────────────────────────────
-SAVE_FILE = "/tmp/deja_vus.json"
 
-def charger_deja_vus():
-    global deja_vus
+# ── VALIDATION CONFIG ──────────────────────────────────────────
+def verifier_config():
+    manquants = []
+    if not TELEGRAM_TOKEN:   manquants.append("TELEGRAM_TOKEN")
+    if not TELEGRAM_CHAT_ID: manquants.append("TELEGRAM_CHAT_ID")
+    if not AUTO1_EMAIL:      manquants.append("AUTO1_EMAIL")
+    if not AUTO1_PASSWORD:   manquants.append("AUTO1_PASSWORD")
+    if manquants:
+        log.error(f"❌ Variables d'environnement manquantes : {', '.join(manquants)}")
+        log.error("Le bot ne peut pas démarrer sans ces variables. Arrêt.")
+        sys.exit(1)
+    if not GEMINI_API_KEY:
+        log.warning("⚠️ GEMINI_API_KEY absent : les annonces seront envoyées sans score/analyse IA "
+                    "(SCORE_MIN ne pourra jamais être évalué → toutes les annonces neuves seront alertées)")
+
+
+# ── SAUVEGARDE / CHARGEMENT ÉTAT ───────────────────────────────
+def charger_etat():
+    global deja_vus, stats_jour, meilleures_annonces, resume_envoye_aujourdhui
     try:
         if os.path.exists(SAVE_FILE):
             with open(SAVE_FILE, "r") as f:
-                deja_vus = set(json.load(f))
-            log.info(f"📂 {len(deja_vus)} annonces chargées")
+                data = json.load(f)
+            deja_vus = set(data.get("deja_vus", []))
+            if data.get("stats_jour", {}).get("date") == str(date.today()):
+                stats_jour = data.get("stats_jour", stats_jour)
+                meilleures_annonces = data.get("meilleures_annonces", [])
+                resume_envoye_aujourdhui = data.get("resume_envoye", False)
+            log.info(f"📂 État chargé : {len(deja_vus)} annonces déjà vues")
     except Exception as e:
-        log.error("Erreur chargement : %s", e)
+        log.error("Erreur chargement état : %s", e)
 
-def sauvegarder_deja_vus():
+def sauvegarder_etat():
     try:
+        with etat_lock:
+            payload = {
+                "deja_vus": list(deja_vus),
+                "stats_jour": stats_jour,
+                "meilleures_annonces": meilleures_annonces[:10],
+                "resume_envoye": resume_envoye_aujourdhui,
+            }
         with open(SAVE_FILE, "w") as f:
-            json.dump(list(deja_vus), f)
+            json.dump(payload, f)
     except Exception as e:
-        log.error("Erreur sauvegarde : %s", e)
+        log.error("Erreur sauvegarde état : %s", e)
+
 
 # ── CONNEXION AUTO1 ───────────────────────────────────────────
-def connexion():
-    global derniere_connexion
-    log.info("🔑 Connexion à auto1.com...")
+def connexion(tentative=1, max_tentatives=3):
+    global derniere_connexion_ok, derniere_connexion_ts
+    log.info(f"🔑 Connexion à auto1.com (tentative {tentative}/{max_tentatives})...")
     try:
         r = session.get("https://www.auto1.com/fr/home/login", timeout=15)
+        log.info(f"   → page login : statut {r.status_code}, {len(r.text)} caractères reçus")
         soup = BeautifulSoup(r.text, "lxml")
         csrf_input = soup.find("input", {"name": re.compile(r"csrf|_token", re.I)})
         csrf = csrf_input["value"] if csrf_input else ""
+        if not csrf_input:
+            log.warning("   ⚠️ Aucun token CSRF trouvé — la page de login a peut-être une structure "
+                        "différente (rendu JS, captcha, ou formulaire chargé dynamiquement)")
+
         r2 = session.post(
             "https://www.auto1.com/fr/home/login",
             data={"email": AUTO1_EMAIL, "password": AUTO1_PASSWORD, "_token": csrf},
             timeout=15, allow_redirects=True
         )
-        if "logout" in r2.text.lower():
+        log.info(f"   → réponse login : statut {r2.status_code}, url finale {r2.url}")
+
+        if "logout" in r2.text.lower() or "déconnexion" in r2.text.lower():
             log.info("✅ Connecté à Auto1")
-            derniere_connexion = datetime.now()
+            derniere_connexion_ok = True
+            derniere_connexion_ts = datetime.now()
             return True
-        else:
-            log.warning("⚠️ Connexion incertaine")
-            return False
+
+        log.warning("⚠️ Connexion incertaine : ni 'logout' ni 'déconnexion' trouvés dans la réponse. "
+                    "Soit les identifiants sont refusés, soit le site utilise un mécanisme de login "
+                    "différent (API JS, 2FA, captcha).")
+        derniere_connexion_ok = False
+        if tentative < max_tentatives:
+            time.sleep(5)
+            return connexion(tentative + 1, max_tentatives)
+        return False
     except Exception as e:
         log.error("Erreur connexion : %s", e)
+        derniere_connexion_ok = False
         return False
 
 def verifier_session():
-    global derniere_connexion
-    if not derniere_connexion or (datetime.now() - derniere_connexion).seconds > 7200:
+    if not derniere_connexion_ok or not derniere_connexion_ts or (datetime.now() - derniere_connexion_ts).seconds > 7200:
         connexion()
 
-# ── GEMINI AI (amélioré) ──────────────────────────────────────
+
+# ── GEMINI AI ───────────────────────────────────────────────
 def analyser_avec_gemini(voiture):
     if not GEMINI_API_KEY:
         return None, None, None
@@ -142,7 +224,9 @@ Réponds en JSON uniquement, sans markdown, sans backticks :
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         r = requests.post(url, json=payload, timeout=15)
-        r.raise_for_status()
+        if r.status_code != 200:
+            log.error(f"Gemini HTTP {r.status_code} : {r.text[:300]}")
+            return None, None, None
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         text = text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(text)
@@ -163,89 +247,38 @@ Réponds en JSON uniquement, sans markdown, sans backticks :
         log.error("Gemini erreur : %s", e)
         return None, None, None
 
-# ── RÉSUMÉ QUOTIDIEN 20H ─────────────────────────────────────
-def envoyer_resume_quotidien():
-    log.info("📊 Envoi résumé quotidien...")
-    if meilleures_annonces:
-        texte = (
-            f"🌅 *Résumé du jour — {escape_md(str(date.today().strftime('%d/%m/%Y')))}*\n\n"
-            f"📊 {escape_md(str(stats_jour['total']))} annonces vues\n"
-            f"🔔 {escape_md(str(stats_jour['alertes']))} alertes envoyées\n\n"
-            f"🏆 *Top annonces du jour :*\n\n"
-        )
-        for i, v in enumerate(meilleures_annonces[:5], 1):
-            texte += (
-                f"{i}\\. ⭐ *{escape_md(str(v.get('gemini_score','?')))}*/10 — "
-                f"[{escape_md(v['titre'])}]({v['url']})\n"
-                f"   💰 {escape_md(str(v['prix']))}€ | 📏 {escape_md(str(v['km']))}km | {escape_md(v.get('gemini_verdict',''))}\n\n"
-            )
-    else:
-        texte = (
-            f"🌅 *Résumé du jour — {escape_md(str(date.today().strftime('%d/%m/%Y')))}*\n\n"
-            f"📊 {escape_md(str(stats_jour['total']))} annonces vues\n"
-            f"😴 Aucune affaire intéressante aujourd'hui\\."
-        )
-    envoyer_telegram_message(TELEGRAM_CHAT_ID, texte)
-
-    # Aussi via ntfy
-    try:
-        corps = f"📊 {stats_jour['total']} annonces vues, {stats_jour['alertes']} alertes"
-        if meilleures_annonces:
-            v = meilleures_annonces[0]
-            corps += f"\n🏆 Meilleure : {v['titre']} — {v['prix']}€ (⭐{v.get('gemini_score','?')}/10)"
-        requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=corps.encode("utf-8"),
-            headers={"Title": f"📅 Résumé Auto1 — {date.today().strftime('%d/%m/%Y')}", "Tags": "calendar,auto1"},
-            timeout=10
-        )
-    except Exception as e:
-        log.error("Ntfy résumé erreur : %s", e)
-
-# ── NTFY.SH ───────────────────────────────────────────────────
-def envoyer_ntfy(voiture, score=None, verdict=None):
-    try:
-        if score and isinstance(score, (int, float)):
-            if score >= 8:   priority, emoji = "urgent", "🔥"
-            elif score >= 6: priority, emoji = "high", "✅"
-            else:            priority, emoji = "default", "🚗"
-        else:
-            priority, emoji = "default", "🚗"
-
-        titre_notif = f"{emoji} {voiture['titre']} — {voiture['prix']}€"
-        corps_notif = (
-            f"{voiture['profil']}\n"
-            f"📏 {voiture['km']} km | ⛽ {voiture['carbu']} | 📅 {voiture['annee']}\n"
-        )
-        if verdict:
-            corps_notif += f"🤖 {verdict}\n"
-        corps_notif += f"👉 {voiture['url']}"
-
-        requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=corps_notif.encode("utf-8"),
-            headers={
-                "Title": titre_notif,
-                "Priority": priority,
-                "Tags": "car,auto1",
-                "Click": voiture["url"],
-            },
-            timeout=10
-        )
-        log.info(f"📲 Ntfy envoyé : {voiture['titre']}")
-    except Exception as e:
-        log.error("Ntfy erreur : %s", e)
 
 # ── TELEGRAM ──────────────────────────────────────────────────
 def escape_md(t):
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', str(t))
 
 def envoyer_telegram_message(chat_id, texte, parse_mode="MarkdownV2"):
+    """Envoie un message Telegram et VÉRIFIE la réponse (corrige le bug des échecs silencieux)."""
+    if not TELEGRAM_TOKEN or not chat_id:
+        log.error("Telegram non configuré (token/chat_id manquant), message non envoyé")
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": texte, "parse_mode": parse_mode}, timeout=10)
+        r = requests.post(url, json={"chat_id": chat_id, "text": texte, "parse_mode": parse_mode}, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            return True
+
+        log.error(f"❌ Telegram a refusé le message : {data.get('description')}")
+        # Filet de sécurité : si c'est un problème de parsing Markdown, on renvoie en texte brut
+        # plutôt que de perdre la notification.
+        if "parse" in str(data.get("description", "")).lower() or "entit" in str(data.get("description", "")).lower():
+            brut = re.sub(r'\\(.)', r'\1', texte)  # retire les échappements markdown
+            r2 = requests.post(url, json={"chat_id": chat_id, "text": brut}, timeout=10)
+            data2 = r2.json()
+            if data2.get("ok"):
+                log.info("✅ Message renvoyé avec succès en texte brut après échec du Markdown")
+                return True
+            log.error(f"❌ Échec aussi en texte brut : {data2.get('description')}")
+        return False
     except Exception as e:
-        log.error("Telegram erreur : %s", e)
+        log.error("Telegram erreur réseau : %s", e)
+        return False
 
 def envoyer_telegram_annonce(voiture, analyse_texte=None):
     texte = (
@@ -259,6 +292,37 @@ def envoyer_telegram_annonce(voiture, analyse_texte=None):
         texte += f"\n{escape_md(analyse_texte)}\n"
     texte += f"\n[👉 Voir l'annonce]({voiture['url']})"
     envoyer_telegram_message(TELEGRAM_CHAT_ID, texte)
+
+
+# ── NTFY.SH ───────────────────────────────────────────────────
+def envoyer_ntfy(voiture, score=None, verdict=None):
+    try:
+        if score and isinstance(score, (int, float)):
+            if score >= 8:   priority, emoji = "urgent", "🔥"
+            elif score >= 6: priority, emoji = "high", "✅"
+            else:            priority, emoji = "default", "🚗"
+        else:
+            priority, emoji = "default", "🚗"
+
+        titre_notif = f"{emoji} {voiture['titre']} — {voiture['prix']}€"
+        corps_notif = f"{voiture['profil']}\n📏 {voiture['km']} km | ⛽ {voiture['carbu']} | 📅 {voiture['annee']}\n"
+        if verdict:
+            corps_notif += f"🤖 {verdict}\n"
+        corps_notif += f"👉 {voiture['url']}"
+
+        r = requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=corps_notif.encode("utf-8"),
+            headers={"Title": titre_notif, "Priority": priority, "Tags": "car,auto1", "Click": voiture["url"]},
+            timeout=10
+        )
+        if r.status_code >= 300:
+            log.error(f"❌ Ntfy a répondu {r.status_code} : {r.text[:200]}")
+        else:
+            log.info(f"📲 Ntfy envoyé : {voiture['titre']}")
+    except Exception as e:
+        log.error("Ntfy erreur : %s", e)
+
 
 # ── EMAIL ─────────────────────────────────────────────────────
 def envoyer_email(nouveaux):
@@ -298,10 +362,11 @@ def envoyer_email(nouveaux):
     except Exception as e:
         log.error("Email : %s", e)
 
+
 # ── SCRAPING ──────────────────────────────────────────────────
 def construire_url(c):
     from urllib.parse import urlencode
-    p = [("sort","price_asc"), ("per_page", 48)]
+    p = [("sort", "price_asc"), ("per_page", 48)]
     if c.get("make"):     p.append(("makes[]", c["make"]))
     if c.get("model"):    p.append(("models[]", c["model"]))
     if c.get("prix_min"): p.append(("price[min]", c["prix_min"]))
@@ -312,26 +377,33 @@ def construire_url(c):
     if c.get("year_max"): p.append(("year[max]", c["year_max"]))
     for f in c.get("fuel", []): p.append(("fuel[]", f))
     if c.get("type"):     p.append(("categories[]", c["type"]))
-    return f"https://www.auto1.com/fr/home/buy?{urlencode(p)}"
+    return f"{AUTO1_BUY_URL_BASE}?{urlencode(p)}"
 
 def chercher_liste(obj, d=0):
     if d > 6: return []
     if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], dict):
-        if any(k in obj[0] for k in ["price","make","model","id"]): return obj
+        if any(k in obj[0] for k in ["price", "make", "model", "id"]): return obj
     if isinstance(obj, dict):
         for v in obj.values():
-            r = chercher_liste(v, d+1)
+            r = chercher_liste(v, d + 1)
             if r: return r
     return []
 
 def formater_json(v, c):
     vid = str(v.get("id") or v.get("uuid") or "")
+    titre = f"{v.get('make','') or v.get('brand','')} {v.get('model','')} {v.get('year','') or v.get('firstRegistrationYear','')}".strip()
+    prix = v.get("price") or v.get("grossPrice") or "?"
+    km = v.get("mileage") or v.get("kilometers") or "?"
+    if not vid:
+        # Filet de sécurité : si Auto1 ne renvoie pas d'ID exploitable, on en génère un stable
+        # à partir du contenu plutôt que de jeter l'annonce silencieusement (bug corrigé).
+        vid = hashlib.md5(f"{titre}-{prix}-{km}".encode()).hexdigest()[:12]
     return {
         "id":     vid,
         "profil": c["nom"],
-        "titre":  f"{v.get('make','') or v.get('brand','')} {v.get('model','')} {v.get('year','') or v.get('firstRegistrationYear','')}".strip(),
-        "prix":   v.get("price") or v.get("grossPrice") or "?",
-        "km":     v.get("mileage") or v.get("kilometers") or "?",
+        "titre":  titre,
+        "prix":   prix,
+        "km":     km,
         "carbu":  v.get("fuelType") or v.get("fuel") or "?",
         "annee":  v.get("year") or v.get("firstRegistrationYear") or "?",
         "url":    v.get("url") or f"https://www.auto1.com/car/{vid}",
@@ -341,31 +413,129 @@ def formater_json(v, c):
 def scraper(url, c):
     try:
         r = session.get(url, timeout=20)
-        r.raise_for_status()
+        if r.status_code != 200:
+            log.error(f"[{c['nom']}] HTTP {r.status_code} sur {url}")
+            return []
         soup = BeautifulSoup(r.text, "lxml")
         scripts = soup.find_all("script", {"id": "__NEXT_DATA__"})
-        if scripts:
-            data = json.loads(scripts[0].string)
-            cars = chercher_liste(data)
-            return [formater_json(v, c) for v in cars]
-        return []
+        if not scripts:
+            log.warning(f"[{c['nom']}] Aucun bloc __NEXT_DATA__ trouvé ({len(r.text)} caractères reçus) — "
+                        "structure de page différente ou contenu chargé en JS")
+            return []
+        data = json.loads(scripts[0].string)
+        cars = chercher_liste(data)
+        return [formater_json(v, c) for v in cars]
     except Exception as e:
         log.error("[%s] Erreur scraping : %s", c["nom"], e)
         return []
+
+
+# ── DIAGNOSTIC DE DÉMARRAGE ─────────────────────────────────────
+def diagnostic_demarrage():
+    """Lance un test complet et envoie un rapport clair sur Telegram.
+    C'est LE point d'entrée pour comprendre pourquoi rien n'arrive."""
+    global dernier_diagnostic
+    rapport = ["🔍 *Diagnostic Auto1 Monitor*\n"]
+
+    login_ok = connexion()
+    rapport.append(f"🔑 Connexion Auto1 : {'✅ OK' if login_ok else '❌ ÉCHEC'}")
+
+    if RECHERCHES:
+        test = RECHERCHES[0]
+        url_test = construire_url(test)
+        rapport.append(f"🌐 Test sur : {escape_md(test['nom'])}")
+        try:
+            r = session.get(url_test, timeout=20)
+            rapport.append(f"📡 Statut HTTP : *{r.status_code}* — {len(r.text)} caractères reçus")
+            soup = BeautifulSoup(r.text, "lxml")
+            scripts = soup.find_all("script", {"id": "__NEXT_DATA__"})
+            trouve = bool(scripts)
+            rapport.append(f"📦 Bloc de données trouvé : {'✅ oui' if trouve else '❌ NON'}")
+            nb_cars = 0
+            if trouve:
+                data = json.loads(scripts[0].string)
+                cars = chercher_liste(data)
+                nb_cars = len(cars)
+                rapport.append(f"🚗 Annonces détectées : *{nb_cars}*")
+            else:
+                rapport.append("⚠️ Sans ce bloc, le bot ne peut rien extraire \\(cause la plus probable "
+                                "du 'aucune notification'\\)\\. Page peut-être protégée ou rendue en JS\\.")
+            dernier_diagnostic = {"login_ok": login_ok, "http_status": r.status_code,
+                                   "next_data_trouve": trouve, "nb_cars": nb_cars, "ts": datetime.now().isoformat()}
+        except Exception as e:
+            rapport.append(f"❌ Erreur pendant le test : {escape_md(str(e))}")
+            dernier_diagnostic = {"erreur": str(e), "ts": datetime.now().isoformat()}
+    else:
+        rapport.append("⚠️ RECHERCHES est vide\\.")
+
+    rapport.append("\n_Renvoie ce rapport si le problème persiste — ça permet de cibler le vrai correctif._")
+    texte = "\n".join(rapport)
+    log.info("DIAGNOSTIC: " + json.dumps(dernier_diagnostic, ensure_ascii=False))
+    envoyer_telegram_message(TELEGRAM_CHAT_ID, texte)
+
+
+# ── RÉSUMÉ QUOTIDIEN ─────────────────────────────────────────
+def envoyer_resume_quotidien():
+    log.info("📊 Envoi résumé quotidien...")
+    if meilleures_annonces:
+        texte = (
+            f"🌅 *Résumé du jour — {escape_md(date.today().strftime('%d/%m/%Y'))}*\n\n"
+            f"📊 {escape_md(stats_jour['total'])} annonces vues\n"
+            f"🔔 {escape_md(stats_jour['alertes'])} alertes envoyées\n\n"
+            f"🏆 *Top annonces du jour :*\n\n"
+        )
+        for i, v in enumerate(meilleures_annonces[:5], 1):
+            texte += (
+                f"{i}\\. ⭐ *{escape_md(v.get('gemini_score','?'))}*/10 — "
+                f"[{escape_md(v['titre'])}]({v['url']})\n"
+                f"   💰 {escape_md(v['prix'])}€ | 📏 {escape_md(v['km'])}km | {escape_md(v.get('gemini_verdict',''))}\n\n"
+            )
+    else:
+        texte = (
+            f"🌅 *Résumé du jour — {escape_md(date.today().strftime('%d/%m/%Y'))}*\n\n"
+            f"📊 {escape_md(stats_jour['total'])} annonces vues\n"
+            f"😴 Aucune affaire intéressante aujourd'hui\\."
+        )
+    envoyer_telegram_message(TELEGRAM_CHAT_ID, texte)
+
+    try:
+        corps = f"📊 {stats_jour['total']} annonces vues, {stats_jour['alertes']} alertes"
+        if meilleures_annonces:
+            v = meilleures_annonces[0]
+            corps += f"\n🏆 Meilleure : {v['titre']} — {v['prix']}€ (⭐{v.get('gemini_score','?')}/10)"
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=corps.encode("utf-8"),
+            headers={"Title": f"📅 Résumé Auto1 — {date.today().strftime('%d/%m/%Y')}", "Tags": "calendar,auto1"},
+            timeout=10
+        )
+    except Exception as e:
+        log.error("Ntfy résumé erreur : %s", e)
+
 
 # ── BOT TELEGRAM (commandes) ──────────────────────────────────
 last_update_id = None
 
 def ecouter_telegram():
     global last_update_id, surveillance_active
+    try:
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook", timeout=10)
+    except Exception as e:
+        log.warning("Impossible de supprimer le webhook existant : %s", e)
+
     log.info("👂 Écoute des commandes Telegram...")
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
             params = {"timeout": 30, "offset": last_update_id}
             r = requests.get(url, params=params, timeout=35)
-            updates = r.json().get("result", [])
-            for update in updates:
+            payload = r.json()
+            if not payload.get("ok"):
+                log.error("Erreur getUpdates Telegram : %s", payload.get("description"))
+                time.sleep(5)
+                continue
+
+            for update in payload.get("result", []):
                 last_update_id = update["update_id"] + 1
                 msg = update.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
@@ -381,44 +551,46 @@ def ecouter_telegram():
                         f"🌅 Résumé automatique à {HEURE_RESUME}h\n"
                         f"🔄 Intervalle : *{INTERVALLE_SEC}s*\n"
                         f"📊 Surveillance : {escape_md(statut)}\n\n"
-                        "Commandes : /status /pause /resume /stats /resume\\_jour /help"
+                        "Commandes : /status /pause /resume /stats /resume\\_jour /diagnostic /help"
                     )
                     envoyer_telegram_message(chat_id, reponse)
 
                 elif texte == "/pause":
-                    surveillance_active = False
-                    envoyer_telegram_message(chat_id,
-                        "⏸️ *Surveillance mise en pause*\n\nEnvoie /resume pour reprendre\\.")
+                    with etat_lock:
+                        surveillance_active = False
+                    envoyer_telegram_message(chat_id, "⏸️ *Surveillance mise en pause*\n\nEnvoie /resume pour reprendre\\.")
 
                 elif texte == "/resume":
-                    surveillance_active = True
-                    envoyer_telegram_message(chat_id,
-                        "▶️ *Surveillance reprise\\!*\n\nLe bot surveille à nouveau Auto1\\.")
+                    with etat_lock:
+                        surveillance_active = True
+                    envoyer_telegram_message(chat_id, "▶️ *Surveillance reprise\\!*\n\nLe bot surveille à nouveau Auto1\\.")
 
                 elif texte == "/status":
                     statut = "🟢 Active" if surveillance_active else "🔴 En pause"
+                    co = "✅ OK" if derniere_connexion_ok else "❌ ÉCHEC/inconnue"
                     reponse = (
                         f"📊 *Statut du bot*\n\n"
                         f"Surveillance : {escape_md(statut)}\n"
-                        f"👁️ Annonces vues : *{escape_md(str(len(deja_vus)))}*\n"
-                        f"🔔 Alertes aujourd'hui : *{escape_md(str(stats_jour['alertes']))}*\n"
-                        f"🔄 Cycles effectués : *{escape_md(str(cycle_count))}*\n"
+                        f"🔑 Connexion Auto1 : {escape_md(co)}\n"
+                        f"👁️ Annonces vues \\(total\\) : *{escape_md(len(deja_vus))}*\n"
+                        f"🔔 Alertes aujourd'hui : *{escape_md(stats_jour['alertes'])}*\n"
+                        f"🔄 Cycles effectués : *{escape_md(cycle_count)}*\n"
                         f"🤖 Gemini : {'✅ actif' if GEMINI_API_KEY else '❌ non configuré'}\n"
-                        f"📲 Ntfy : ✅ `{escape_md(NTFY_TOPIC)}`\n"
                         f"⭐ Score min alerte : *{SCORE_MIN}/10*\n"
                         f"🌅 Résumé à : *{HEURE_RESUME}h00*\n"
-                        f"🕒 {escape_md(datetime.now().strftime('%d/%m/%Y %H:%M'))}"
+                        f"🕒 {escape_md(datetime.now().strftime('%d/%m/%Y %H:%M'))}\n\n"
+                        f"Tape /diagnostic pour un test complet de scraping\\."
                     )
                     envoyer_telegram_message(chat_id, reponse)
 
                 elif texte == "/stats":
                     if meilleures_annonces:
-                        reponse = f"🏆 *Meilleures annonces du jour*\n\n"
+                        reponse = "🏆 *Meilleures annonces du jour*\n\n"
                         for i, v in enumerate(meilleures_annonces[:5], 1):
                             reponse += (
-                                f"{i}\\. ⭐ *{escape_md(str(v.get('gemini_score','?')))}*/10 — "
+                                f"{i}\\. ⭐ *{escape_md(v.get('gemini_score','?'))}*/10 — "
                                 f"[{escape_md(v['titre'])}]({v['url']})\n"
-                                f"   💰 {escape_md(str(v['prix']))}€ | 📏 {escape_md(str(v['km']))}km\n\n"
+                                f"   💰 {escape_md(v['prix'])}€ | 📏 {escape_md(v['km'])}km\n\n"
                             )
                     else:
                         reponse = "📊 *Stats du jour*\n\nAucune annonce intéressante encore trouvée\\."
@@ -426,6 +598,10 @@ def ecouter_telegram():
 
                 elif texte == "/resume_jour":
                     envoyer_resume_quotidien()
+
+                elif texte == "/diagnostic":
+                    envoyer_telegram_message(chat_id, "🔍 Lancement du diagnostic, un instant\\.\\.\\.")
+                    diagnostic_demarrage()
 
                 elif texte == "/help":
                     reponse = (
@@ -436,61 +612,58 @@ def ecouter_telegram():
                         "/resume \\- Reprendre la surveillance\n"
                         "/stats \\- Top annonces du jour\n"
                         "/resume\\_jour \\- Résumé immédiat\n"
+                        "/diagnostic \\- Test complet de connexion et scraping\n"
                         "/help \\- Aide"
                     )
                     envoyer_telegram_message(chat_id, reponse)
 
         except Exception as e:
             log.error("Erreur écoute Telegram : %s", e)
+            time.sleep(3)
         time.sleep(1)
+
 
 # ── BOUCLE PRINCIPALE ─────────────────────────────────────────
 def main():
     global cycle_count, stats_jour, meilleures_annonces, resume_envoye_aujourdhui
 
     log.info("🚀 Auto1 Monitor démarré")
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("❌ TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID manquant !")
-        return
-    if not AUTO1_EMAIL or not AUTO1_PASSWORD:
-        log.error("❌ AUTO1_EMAIL ou AUTO1_PASSWORD manquant !")
-        return
-
-    charger_deja_vus()
+    verifier_config()
+    charger_etat()
 
     t = threading.Thread(target=ecouter_telegram, daemon=True)
     t.start()
 
-    connexion()
+    # Rapport de diagnostic immédiat — c'est la pièce maîtresse pour comprendre
+    # pourquoi tu ne recevais rien jusqu'ici.
+    diagnostic_demarrage()
 
     envoyer_telegram_message(
         TELEGRAM_CHAT_ID,
         f"🚀 *Auto1 Monitor actif\\!*\n"
         f"✅ {len(RECHERCHES)} profils surveillés\n"
-        f"🤖 Gemini AI : cote marché \\+ fiabilité activées\n"
-        f"📲 Ntfy\\.sh : `{escape_md(NTFY_TOPIC)}`\n"
+        f"🤖 Gemini AI : {'✅ activé' if GEMINI_API_KEY else '❌ non configuré'}\n"
         f"⭐ Score min alerte : {SCORE_MIN}/10\n"
         f"🌅 Résumé quotidien à {HEURE_RESUME}h00\n"
         f"🔄 Cycle toutes les {INTERVALLE_SEC}s\n\n"
-        f"Commandes : /status /pause /resume /stats /help"
+        f"Commandes : /status /pause /resume /stats /diagnostic /help"
     )
 
     while True:
         now = datetime.now()
 
-        # Reset stats quotidiennes
         today_str = str(date.today())
         if today_str != stats_jour["date"]:
-            stats_jour = {"total": 0, "alertes": 0, "date": today_str}
-            meilleures_annonces = []
-            resume_envoye_aujourdhui = False
+            with etat_lock:
+                stats_jour = {"total": 0, "alertes": 0, "date": today_str}
+                meilleures_annonces = []
+                resume_envoye_aujourdhui = False
             log.info("📅 Nouveau jour — stats réinitialisées")
 
-        # Résumé quotidien automatique à 20h
         if now.hour == HEURE_RESUME and not resume_envoye_aujourdhui:
             envoyer_resume_quotidien()
-            resume_envoye_aujourdhui = True
+            with etat_lock:
+                resume_envoye_aujourdhui = True
 
         if not surveillance_active:
             log.info("⏸️ Surveillance en pause...")
@@ -507,25 +680,36 @@ def main():
         for c in RECHERCHES:
             url = construire_url(c)
             vlist = scraper(url, c)
+            log.info(f"  [{c['nom']}] {len(vlist)} annonces récupérées sur la page")
+
+            nouveaux_ce_profil = 0
             for v in vlist:
                 cle = f"{c['nom']}|{v['id']}"
-                if v["id"] and cle not in deja_vus:
+                if cle in deja_vus:
+                    continue
+                with etat_lock:
                     deja_vus.add(cle)
                     stats_jour["total"] += 1
+                nouveaux_ce_profil += 1
 
-                    score, verdict, analyse_texte = analyser_avec_gemini(v)
-                    v["gemini_score"]   = score
-                    v["gemini_verdict"] = verdict or "—"
+                score, verdict, analyse_texte = analyser_avec_gemini(v)
+                v["gemini_score"]   = score
+                v["gemini_verdict"] = verdict or "—"
 
-                    log.info(f"  🆕 {v['titre']} — {v['prix']}€ | Score: {score}/10")
+                log.info(f"  🆕 {v['titre']} — {v['prix']}€ | Score: {score}/10")
 
-                    if score and isinstance(score, (int, float)) and score >= 7:
+                if score and isinstance(score, (int, float)) and score >= 7:
+                    with etat_lock:
                         meilleures_annonces.append(v)
-                        meilleures_annonces.sort(key=lambda x: x.get("gemini_score", 0), reverse=True)
+                        meilleures_annonces.sort(key=lambda x: x.get("gemini_score", 0) or 0, reverse=True)
 
-                    if score is None or (isinstance(score, (int, float)) and score >= SCORE_MIN):
-                        nouveaux_a_alerter.append((v, analyse_texte, score, verdict))
+                if score is None or (isinstance(score, (int, float)) and score >= SCORE_MIN):
+                    nouveaux_a_alerter.append((v, analyse_texte, score, verdict))
+                    with etat_lock:
                         stats_jour["alertes"] += 1
+
+            if nouveaux_ce_profil == 0 and not vlist:
+                log.info(f"  [{c['nom']}] ⚠️ 0 annonce récupérée — voir /diagnostic si ça persiste")
 
             time.sleep(3)
 
@@ -537,10 +721,11 @@ def main():
         if nouveaux_a_alerter:
             envoyer_email([item[0] for item in nouveaux_a_alerter])
 
-        sauvegarder_deja_vus()
+        sauvegarder_etat()
 
         log.info(f"😴 Prochain cycle dans {INTERVALLE_SEC}s... ({stats_jour['alertes']} alertes aujourd'hui)")
         time.sleep(INTERVALLE_SEC)
+
 
 if __name__ == "__main__":
     main()
